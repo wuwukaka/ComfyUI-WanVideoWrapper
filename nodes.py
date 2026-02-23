@@ -1208,6 +1208,7 @@ class WanVideoAnimateEmbeds:
                 "bg_images": ("IMAGE", {"tooltip": "background images"}),
                 "mask": ("MASK", {"tooltip": "mask"}),
                 "start_ref_image": ("IMAGE", {"tooltip": "start ref image"}),
+                "transition_video": ("IMAGE", {"default": None, "tooltip": "Transition video frames (32 images, encoded to 8 latent frames). Acts as hard conditioning guide for seamless connection."}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
             }
         }
@@ -1218,7 +1219,8 @@ class WanVideoAnimateEmbeds:
     CATEGORY = "WanVideoWrapper"
 
     def process(self, vae, width, height, num_frames, force_offload, frame_window_size, colormatch, pose_strength, face_strength,
-                ref_images=None, pose_images=None, face_images=None, clip_embeds=None, tiled_vae=False, bg_images=None, mask=None, start_ref_image=None):
+                ref_images=None, pose_images=None, face_images=None, clip_embeds=None, tiled_vae=False, bg_images=None, mask=None, start_ref_image=None,
+                transition_video=None):
         
         W = (width // 16) * 16
         H = (height // 16) * 16
@@ -1229,6 +1231,26 @@ class WanVideoAnimateEmbeds:
         num_refs = ref_images.shape[0] if ref_images is not None else 0
         num_frames = ((num_frames - 1) // 4) * 4 + 1
 
+        if transition_video is not None: 
+            
+            # --- [Core Mod] Reserve space for insertion logic and shift subsequent actions ---
+            # 1. Expand canvas: Add space for 32 pixel frames (corresponding to 8 Latent frames).
+            num_frames += 32
+            
+            # 2. Shift signals: Pad all user-provided control signals at the beginning by repeating frame 0 for 32 frames.
+            # This accurately shifts the original 1st frame's action to the 33rd frame (Latent's 9th frame).
+            if pose_images is not None:
+                pose_images = torch.cat([pose_images[0:1].repeat(32, 1, 1, 1), pose_images], dim=0)
+            if face_images is not None:
+                face_images = torch.cat([face_images[0:1].repeat(32, 1, 1, 1), face_images], dim=0)
+            if bg_images is not None:
+                bg_images = torch.cat([bg_images[0:1].repeat(32, 1, 1, 1), bg_images], dim=0)
+            if mask is not None:
+                mask = torch.cat([mask[0:1].repeat(32, 1, 1), mask], dim=0)
+            # ----------------------------------------------------
+
+            if start_ref_image is not None:
+                log.warning("Both transition_video and start_ref_image provided. Using transition_video only (loop disabled).")
         looping = num_frames > frame_window_size or start_ref_image is not None
 
         if num_frames < frame_window_size:
@@ -1334,6 +1356,63 @@ class WanVideoAnimateEmbeds:
                 resized_start_ref_image = start_ref_image.permute(3, 0, 1, 2) # C, T, H, W
             resized_start_ref_image = resized_start_ref_image[:3] * 2 - 1
 
+        # ============ Transition video processing ============
+        transition_latent = None
+        transition_mask_values = None
+
+        if transition_video is not None:
+            # transition_video input: 32 images [B, H, W, C]
+            # Expecting B=32, which encodes to 8 latent frames
+            b, h, w, c = transition_video.shape
+            log.info(f"Transition video input: {b} frames, {h}x{w}")
+            
+            # Verify frame count to ensure it is exactly 32 frames
+            expected_input_frames = 32
+            if b != expected_input_frames:
+                log.warning(f"Transition video has {b} frames, expected {expected_input_frames}. Resizing time dimension.")
+                if b > expected_input_frames:
+                    # Downsample to 32 frames
+                    indices = torch.linspace(0, b-1, expected_input_frames).long()
+                    transition_video = transition_video[indices]
+                else:
+                    # Repeat frames to reach 32 frames
+                    repeat_factor = math.ceil(expected_input_frames / b)
+                    transition_video = transition_video.repeat(repeat_factor, 1, 1, 1)[:expected_input_frames]
+            
+            b = transition_video.shape[0]  # It's 32 now
+            
+            # Adjust spatial dimensions to target WxH
+            if h != H or w != W:
+                transition_video = transition_video.reshape(-1, h, w, c)
+                transition_video = common_upscale(transition_video.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
+                transition_video = transition_video.reshape(b, c, H, W).permute(0, 2, 3, 1)  # [B, H, W, C]
+            
+            # Normalize to [-1, 1]
+            transition_video = transition_video.permute(3, 0, 1, 2)  # [C, T, H, W]
+            transition_video = transition_video[:3] * 2 - 1  # Keep only RGB channels
+            
+            
+            # VAE Encoding (32 pixel frames -> 8 latent frames)
+            vae.to(device)
+            transition_latent = vae.encode([transition_video.to(device, vae.dtype)], device, tiled=tiled_vae)[0]
+            log.info(f"Transition latent encoded: {transition_latent.shape[1] if len(transition_latent.shape) > 1 else transition_latent.shape[0]} frames, shape {transition_latent.shape}")
+            transition_len = transition_latent.shape[1]  # It should be 8
+            log.info(f"Transition latent encoded: {transition_len} frames, shape {transition_latent.shape}")
+            
+            # ============ Generate Mask values ============
+            # Force mask to all 1s, making it act purely as a hard conditioning guide.
+            # The model will strictly follow these frames without altering them.
+            transition_mask_values = torch.ones(transition_len)
+            
+            log.info("Transition mask: forced to all 1s for hard conditioning.")
+            log.info(f"Mask values: {transition_mask_values.tolist()}")
+            # ==========================================
+            
+            if force_offload:
+                transition_latent = transition_latent.to(offload_device)
+                transition_mask_values = transition_mask_values.to(offload_device)
+        # ================================================
+
         seq_len = math.ceil((target_shape[2] * target_shape[3]) / 4 * target_shape[1])
         
         if force_offload:
@@ -1353,6 +1432,8 @@ class WanVideoAnimateEmbeds:
             "ref_latent": ref_latent,
             "ref_image": resized_ref_images if ref_images is not None else None,
             "start_ref_image": resized_start_ref_image if start_ref_image is not None else None,
+            "transition_latent": transition_latent,
+            "transition_mask_values": transition_mask_values,
             "face_pixels": resized_face_images if face_images is not None else None,
             "num_frames": num_frames,
             "target_shape": target_shape,

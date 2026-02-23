@@ -476,6 +476,18 @@ class WanVideoSampler:
         # region WanAnim inputs
         frame_window_size = image_embeds.get("frame_window_size", 77)
         wananimate_loop = image_embeds.get("looping", False)
+        # ============ Global transition_video read ============
+        transition_latent = image_embeds.get("transition_latent", None)
+        transition_mask_values = image_embeds.get("transition_mask_values", None)
+        transition_len = transition_latent.shape[1] if transition_latent is not None else 0
+        has_transition = transition_latent is not None
+
+
+        if has_transition:
+            log.info(f"Transition video: {transition_len} latent frames")
+            if transition_mask_values is not None:
+                log.info(f"Linear decay mask values: {transition_mask_values.tolist()}")
+        # ================================================================
         if wananimate_loop and context_options is not None:
             raise Exception("context_options are not compatible or necessary with WanAnim looping, since it creates the video in a loop.")
         wananim_pose_latents = image_embeds.get("pose_latents", None)
@@ -1851,6 +1863,10 @@ class WanVideoSampler:
                         enhance_enabled = True
                     #region context windowing
                     if context_options is not None:
+                        # ============ Get latent spatial dimensions ============
+                        lat_h = latent.shape[-2]
+                        lat_w = latent.shape[-1]
+                        # ============================================
                         counter = torch.zeros_like(latent_model_input, device=device)
                         noise_pred = torch.zeros_like(latent_model_input, device=device)
                         context_queue = list(context(idx, steps, latent_video_length, context_frames, context_stride, context_overlap))
@@ -1885,11 +1901,37 @@ class WanVideoSampler:
                             partial_img_emb = partial_control_latents = None
                             if image_cond is not None:
                                 partial_img_emb = image_cond[:, c].to(device)
+                                # ============ Build msk channels ============
+                                window_frames = len(c)
+                                window_msk = partial_img_emb[:4].clone()
+                                # ========================================
+                                
+                                # ============ Transition replacement (1st window only) ============
+                                if has_transition and c[0] == 0:
+                                    # image_cond contains [ref_latent (4 channels) + target_latent (16 channels)]
+                                    # Need to skip the first 4 ref_latent channels, replacing only the target_latent part
+                                    # image_cond structure: [image_cond_mask (4) + image_embeds (32)]
+                                    # transition_latent (16 channels) replaces the first 8 frames of image_embeds (16 channels)
+                                    partial_img_emb[4:20, 1:1+transition_len] = transition_latent.to(device, dtype=transition_latent.dtype)
+                                    log.info(f"Replaced first {transition_len} latent frames with transition_video (context_options mode)")
+                                # ============================================================
+
+                                
+                                # ============ Set transition mask ============
+                                if has_transition and c[0] == 0:
+                                    window_trans_start = 1
+                                    window_trans_end = 1 + transition_len
+                                    
+                                    if window_trans_start < window_trans_end:
+                                        mask_slice = transition_mask_values[0:transition_len]
+                                        window_msk[:, window_trans_start:window_trans_end] = mask_slice.view(1, -1, 1, 1)
+                                # ================================================================
                                 if c[0] != 0 and context_reference_latent is not None:
                                     if context_reference_latent.shape[0] == 1: #only single extra init latent
                                         new_init_image = context_reference_latent[0, :, 0].to(device)
                                         # Concatenate the first 4 channels of partial_img_emb with new_init_image to match the required shape
                                         partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0].to(device), new_init_image], dim=0)
+                                        window_msk[:, 0] = image_cond[:4, 0].to(device)
                                     elif context_reference_latent.shape[0] > 1:
                                         num_extra_inits = context_reference_latent.shape[0]
                                         section_size = (latent_video_length / num_extra_inits)
@@ -1898,9 +1940,11 @@ class WanVideoSampler:
                                             log.info(f"extra init image index: {extra_init_index}")
                                         new_init_image = context_reference_latent[extra_init_index, :, 0].to(device)
                                         partial_img_emb[:, 0] = torch.cat([image_cond[:4, 0].to(device), new_init_image], dim=0)
+                                        window_msk[:, 0] = image_cond[:4, 0].to(device)
                                 else:
                                     new_init_image = image_cond[:, 0].to(device)
                                     partial_img_emb[:, 0] = new_init_image
+                                    window_msk[:, 0] = image_cond[:4, 0].to(device)
 
                                 if control_latents is not None:
                                     partial_control_latents = control_latents[:, c]
@@ -2018,11 +2062,17 @@ class WanVideoSampler:
 
                             orig_model_input_frames = partial_latent_model_input.shape[1]
 
+                            # ============ Replace msk placeholder channels ============
+                            # image_cond structure: [image_cond_mask (4) + image_embeds (32)] = 36 channels
+                            # Replace the first 4 channels of image_cond_mask with window_msk
+                            image_cond_in = partial_img_emb.clone()
+                            image_cond_in[:4] = window_msk  # Replace the first 4 channels
+                            # ========================================
                             noise_pred_context, _, new_teacache = predict_with_cfg(
                                 partial_latent_model_input,
                                 cfg[idx], positive,
                                 text_embeds["negative_prompt_embeds"],
-                                partial_timestep, idx, partial_img_emb, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,partial_audio_proj,
+                                partial_timestep, idx, image_cond_in, clip_fea, partial_control_latents, partial_vace_context, partial_unianim_data,partial_audio_proj,
                                 partial_control_camera_latents, partial_add_cond, current_teacache, context_window=c, fantasy_portrait_input=partial_fantasy_portrait_input,
                                 mtv_motion_tokens=partial_mtv_motion_tokens, s2v_audio_input=partial_s2v_audio_input, s2v_motion_frames=[1, 0], s2v_pose=partial_s2v_pose,
                                 humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
@@ -2259,7 +2309,7 @@ class WanVideoSampler:
                             noise = torch.randn(16, latent_window_size + 1, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
                             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
 
-                            if current_ref_images is not None or bg_images is not None or ref_latent is not None:
+                            if current_ref_images is not None or bg_images is not None or ref_latent is not None or has_transition:
                                 if offload:
                                     offload_transformer(transformer, remove_lora=False)
                                     offloaded = True
@@ -2271,21 +2321,62 @@ class WanVideoSampler:
                                 if bg_images is not None:
                                     bg_image_slice = bg_images_in[:, start:end].to(device)
                                 else:
-                                    bg_image_slice = torch.zeros(3, frame_window_size-refert_num, lat_h * 8, lat_w * 8, device=device, dtype=vae.dtype)
-                                if mask_reft_len == 0:
+                                    bg_image_slice = torch.zeros(3, frame_window_size-refert_num, lat_h * 8, lat_w * 8, device=device, dtype=vae.dtype)                                
+                                if mask_reft_len == 0 and not has_transition:
                                     temporal_ref_latents = vae.encode([bg_image_slice], device,tiled=tiled_vae)[0]
                                 else:
-                                    concatenated = torch.cat([current_ref_images.to(device, dtype=vae.dtype), bg_image_slice[:, mask_reft_len:]], dim=1)
-                                    temporal_ref_latents = vae.encode([concatenated.to(device, vae.dtype)], device,tiled=tiled_vae, pbar=False)[0]
-                                    msk[:, :mask_reft_len] = 1
-
-                                if msk.shape[1] != temporal_ref_latents.shape[1]:
-                                    if temporal_ref_latents.shape[1] < msk.shape[1]:
-                                        pad_len = msk.shape[1] - temporal_ref_latents.shape[1]
-                                        pad_tensor = temporal_ref_latents[:, -1:].repeat(1, pad_len, 1, 1)
-                                        temporal_ref_latents = torch.cat([temporal_ref_latents, pad_tensor], dim=1)
+                                    # Build concatenated image
+                                    concat_parts = []
+                                    
+                                    # 1. Add start_ref_image (if any)
+                                    if current_ref_images is not None:
+                                        concat_parts.append(current_ref_images.to(device, dtype=vae.dtype))
+                                    
+                                    # 2. Add the remaining part of bg_image_slice
+                                    bg_start_idx = mask_reft_len if current_ref_images is not None else 0
+                                    if bg_image_slice.shape[1] > bg_start_idx:
+                                        concat_parts.append(bg_image_slice[:, bg_start_idx:])
+                                    
+                                    # 3. VAE encode the image part
+                                    if len(concat_parts) > 0:
+                                        image_concat = torch.cat(concat_parts, dim=1)
+                                        temporal_ref_latents = vae.encode([image_concat.to(device, vae.dtype)], device, tiled=tiled_vae, pbar=False)[0]
                                     else:
-                                        temporal_ref_latents = temporal_ref_latents[:, :msk.shape[1]]
+                                        temporal_ref_latents = None
+                                    
+                                    # 4. Initialize mask
+                                    msk = torch.zeros(4, latent_window_size, lat_h, lat_w, device=device, dtype=dtype)
+                                    
+                                    # 4a. Hard mask for start_ref_image
+                                    if current_ref_images is not None:
+                                        msk[:, :mask_reft_len] = 1
+                                    
+                                    # 4b. Hard mask for transition_latent (replaces first 8 target latent frames ON THE FIRST CHUNK ONLY)
+                                    if has_transition and start == 0:  
+                                        if temporal_ref_latents is not None:
+                                            # ============ Mod: Replace first transition_len frames of target latent ============
+                                            # Keep target latent after transition_len
+                                            remaining_target = temporal_ref_latents[:, transition_len:]
+                                            # transition_latent replaces the first transition_len target latent frames
+                                            temporal_ref_latents = torch.cat([transition_latent.to(device, dtype=transition_latent.dtype), remaining_target], dim=1)
+                                            log.info(f"Replaced first {transition_len} target latent frames with transition_video in Chunk 0")
+                                            # ========================================================================
+                                        else:
+                                            # Only transition_latent, no image part
+                                            temporal_ref_latents = transition_latent.to(device, dtype=dtype)
+                                        
+                                        # Set hard mask. 
+                                        transition_start = 0 
+                                        msk[:, transition_start:transition_start+transition_len] = transition_mask_values.to(device).view(1, -1, 1, 1)
+                                    
+                                    # 5. Handle shape mismatch
+                                    if temporal_ref_latents is not None and msk.shape[1] != temporal_ref_latents.shape[1]:
+                                        if temporal_ref_latents.shape[1] < msk.shape[1]:
+                                            pad_len = msk.shape[1] - temporal_ref_latents.shape[1]
+                                            pad_tensor = temporal_ref_latents[:, -1:].repeat(1, pad_len, 1, 1)
+                                            temporal_ref_latents = torch.cat([temporal_ref_latents, pad_tensor], dim=1)
+                                        else:
+                                            temporal_ref_latents = temporal_ref_latents[:, :msk.shape[1]]
 
                                 if ref_latent is not None:
                                     temporal_ref_latents = torch.cat([msk, temporal_ref_latents], dim=0) # 4+C T H W
