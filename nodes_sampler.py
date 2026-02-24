@@ -2321,7 +2321,7 @@ class WanVideoSampler:
                                 if bg_images is not None:
                                     bg_image_slice = bg_images_in[:, start:end].to(device)
                                 else:
-                                    bg_image_slice = torch.zeros(3, frame_window_size-refert_num, lat_h * 8, lat_w * 8, device=device, dtype=vae.dtype)                               
+                                    bg_image_slice = torch.zeros(3, frame_window_size-refert_num, lat_h * 8, lat_w * 8, device=device, dtype=vae.dtype)
                                 if mask_reft_len == 0 and not has_transition:
                                     temporal_ref_latents = vae.encode([bg_image_slice], device,tiled=tiled_vae)[0]
                                 else:
