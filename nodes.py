@@ -1251,7 +1251,8 @@ class WanVideoAnimateEmbeds:
 
             if start_ref_image is not None:
                 log.warning("Both transition_video and start_ref_image provided. Using transition_video only (loop disabled).")
-        looping = num_frames > frame_window_size or start_ref_image is not None
+        effective_frames = num_frames - 32 if transition_video is not None else num_frames
+        looping = effective_frames > frame_window_size or start_ref_image is not None
 
         if num_frames < frame_window_size:
             frame_window_size = num_frames
